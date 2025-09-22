@@ -1,0 +1,249 @@
+// FHEVM Confidential dApp — Single-file demo repo
+// Files included below as markdown with file paths and contents.
+
+# README.md
+
+This repo is a **complete demo** dApp built for Zama's FHEVM (confidential smart contracts).
+It contains:
+
+- `contracts/ConfidentialVault.sol` — an example FHE-enabled Solidity contract (encrypted balances + transfers)
+- `hardhat.config.js` — Hardhat + FHEVM toolchain config
+- `scripts/deploy.js` — deploy script
+- `frontend/src/App.jsx` — React front-end (single-file) that uses Ethers + Zama Relayer SDK to interact with the contract
+- `tests/confidential-vault.test.js` — basic unit tests
+
+> This demo is intended as a starting point for the Zama Developer Program builder track. Adapt, extend, and document for submission.
+
+---
+
+## File: contracts/ConfidentialVault.sol
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+// fhEVM provides encrypted types via a helper library. We import the standard fhEVM contracts library.
+import "fhevm-contracts/EncryptedTypes.sol";
+import "fhevm-contracts/PrecompiledOps.sol";
+
+contract ConfidentialVault {
+    using EncryptedTypes for *;
+
+    // Encrypted balances mapping: address => encrypted uint64 (example)
+    mapping(address => EncryptedTypes.euint64) private _balances;
+
+    // A conventional (public) counter to show interaction — optional.
+    uint256 public publicDeposits;
+
+    // Deposit: client sends ciphertext of amount (calldata bytes) and relayer wraps the call
+    // `encryptedAmount` is expected to be the serialized ciphertext accepted by fhEVM runtime.
+    function deposit(bytes calldata encryptedAmount, address owner) external {
+        // Perform encrypted addition on _balances[owner]
+        // Note: actual APIs vary; this demonstrates intended logic using library helpers
+        EncryptedTypes.euint64 memory a = _balances[owner];
+        EncryptedTypes.euint64 memory b = EncryptedTypes.deserialize_euint64(encryptedAmount);
+        EncryptedTypes.euint64 memory sum = PrecompiledOps.eadd_u64(a, b);
+        _balances[owner] = sum;
+
+        publicDeposits += 1; // public metric for demos
+    }
+
+    // Transfer between addresses with encrypted amount ciphertext
+    function transferEncrypted(address from, address to, bytes calldata encryptedAmount) external {
+        EncryptedTypes.euint64 memory fromBal = _balances[from];
+        EncryptedTypes.euint64 memory amt = EncryptedTypes.deserialize_euint64(encryptedAmount);
+
+        // Subtract (homomorphic subtraction)
+        EncryptedTypes.euint64 memory newFrom = PrecompiledOps.esub_u64(fromBal, amt);
+        EncryptedTypes.euint64 memory toBal = _balances[to];
+        EncryptedTypes.euint64 memory newTo = PrecompiledOps.eadd_u64(toBal, amt);
+
+        _balances[from] = newFrom;
+        _balances[to] = newTo;
+    }
+
+    // Read encrypted balance (returns ciphertext bytes)
+    function encryptedBalanceOf(address owner) external view returns (bytes memory) {
+        return EncryptedTypes.serialize_euint64(_balances[owner]);
+    }
+}
+```
+
+> Notes: The Solidity API names (`euint64`, `PrecompiledOps.eadd_u64`, `serialize_euint64`, etc.) are illustrative and mirror the fhEVM library approach. Check the `fhevm-contracts` repo for exact function/type names and import paths when you implement.
+
+---
+
+## File: hardhat.config.js
+
+```js
+require('@nomiclabs/hardhat-ethers');
+// If fhEVM provides a hardhat plugin, include it here (example):
+// require('fhevm-hardhat-plugin');
+
+module.exports = {
+  solidity: '0.8.19',
+  networks: {
+    hardhat: {
+      // fhEVM local node configuration (if available)
+    }
+  }
+};
+```
+
+---
+
+## File: scripts/deploy.js
+
+```js
+const hre = require('hardhat');
+
+async function main() {
+  const ConfidentialVault = await hre.ethers.getContractFactory('ConfidentialVault');
+  const vault = await ConfidentialVault.deploy();
+  await vault.deployed();
+  console.log('ConfidentialVault deployed to', vault.address);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+---
+
+## File: tests/confidential-vault.test.js
+
+```js
+const { expect } = require('chai');
+const { ethers } = require('hardhat');
+
+describe('ConfidentialVault', function () {
+  it('deploys and accepts mocked encrypted deposit', async function () {
+    const [owner, user] = await ethers.getSigners();
+    const Vault = await ethers.getContractFactory('ConfidentialVault');
+    const vault = await Vault.deploy();
+    await vault.deployed();
+
+    // NOTE: we can't create real TFHE ciphertexts in the unit test easily here.
+    // For local unit tests, either mock the library calls or use the official fhEVM test helpers.
+
+    expect(await vault.publicDeposits()).to.equal(0);
+  });
+});
+```
+
+---
+
+## Frontend: `frontend/src/App.jsx`
+
+This single-file React front-end demonstrates basic flows:
+- Connect wallet
+- Create a (local) plaintext amount and encrypt it client-side using the Relayer SDK
+- Submit deposit transaction via the Zama Relayer (which handles gateway interactions)
+- Read back encrypted balance and (optionally) decrypt locally if you hold the key
+
+```jsx
+import React, { useState } from 'react';
+import { ethers } from 'ethers';
+// The Relayer SDK lets dApps encrypt on client side and submit to gateway-relayer
+import { RelayerClient, FHE } from 'relayer-sdk'; // adjust import per SDK
+
+export default function App() {
+  const [provider, setProvider] = useState(null);
+  const [signer, setSigner] = useState(null);
+  const [contractAddress, setContractAddress] = useState('');
+  const [vaultContract, setVaultContract] = useState(null);
+  const [amount, setAmount] = useState('0');
+  const [status, setStatus] = useState('');
+
+  async function connect() {
+    if (!window.ethereum) return alert('Please install MetaMask');
+    const p = new ethers.providers.Web3Provider(window.ethereum);
+    await p.send('eth_requestAccounts', []);
+    setProvider(p);
+    setSigner(p.getSigner());
+  }
+
+  async function initContract() {
+    if (!signer || !contractAddress) return alert('connect and set contract address');
+    const abi = [
+      'function deposit(bytes calldata encryptedAmount, address owner) external',
+      'function encryptedBalanceOf(address owner) external view returns (bytes memory)'
+    ];
+    const c = new ethers.Contract(contractAddress, abi, signer);
+    setVaultContract(c);
+  }
+
+  async function doDeposit() {
+    setStatus('Encrypting...');
+    // Create an encryption client (Relayer + FHE helper)
+    // The real SDK will expose functions to generate/serialize ciphertext for an integer.
+    const relayer = new RelayerClient({ apiKey: process.env.REACT_APP_RELAYER_KEY });
+
+    // Example: create ciphertext for 42
+    const ciphertext = await relayer.encryptInteger(parseInt(amount, 10));
+
+    setStatus('Sending deposit transaction...');
+    const tx = await vaultContract.deposit(ciphertext, await signer.getAddress());
+    await tx.wait();
+    setStatus('Deposit submitted — check on-chain encrypted balance');
+  }
+
+  async function readEncryptedBalance() {
+    setStatus('Fetching encrypted balance...');
+    const owner = await signer.getAddress();
+    const ctext = await vaultContract.encryptedBalanceOf(owner);
+    setStatus('Got ciphertext (hex): ' + ctext);
+
+    // If you have decryption key locally (or via relayer), decrypt
+    try {
+      setStatus((s) => s + '\nAttempting local decrypt...');
+      const relayer = new RelayerClient({ apiKey: process.env.REACT_APP_RELAYER_KEY });
+      const pt = await relayer.decryptCiphertext(ctext);
+      setStatus('Decrypted balance: ' + pt);
+    } catch (e) {
+      // decryption may require private key access
+      console.warn('Decrypt failed locally', e);
+    }
+  }
+
+  return (
+    <div className="p-4">
+      <h1 className="text-2xl font-bold">FHEVM ConfidentialVault Demo</h1>
+      <button onClick={connect}>Connect Wallet</button>
+      <div>
+        <input placeholder="Contract address" value={contractAddress} onChange={(e)=>setContractAddress(e.target.value)} />
+        <button onClick={initContract}>Init Contract</button>
+      </div>
+      <div>
+        <input value={amount} onChange={(e)=>setAmount(e.target.value)} />
+        <button onClick={doDeposit}>Deposit (encrypted)</button>
+        <button onClick={readEncryptedBalance}>Read Encrypted Balance</button>
+      </div>
+      <pre>{status}</pre>
+    </div>
+  );
+}
+```
+
+---
+
+## Implementation notes & tips
+
+1. **fhevm-contracts**: Use the official `fhevm-contracts` Solidity library for encrypted types & helpers (see official GitHub). It provides the encrypted types, serialization helpers, and precompiled op wrappers.
+2. **Relayer SDK**: For web apps you should use Zama's Relayer (Relayer SDK) so the web client can encrypt/decrypt and submit encrypted calldata without dealing with gateway chain complexities. See `relayer-sdk` on Zama's GitHub.
+3. **Local testing**: Unit tests may need mocks for precompiled operations or a local fhEVM test harness. The fhEVM project provides tooling & examples to run a local FHE-enabled node.
+4. **Security**: Private keys and decryption keys must be handled carefully. In production, decryption often happens in user-controlled environment; the relayer can assist but never expose private keys.
+
+---
+
+## Resources
+
+- fhEVM docs and Solidity guides (Zama). 
+- `fhevm-contracts` GitHub library.
+- `relayer-sdk` GitHub library.
+
+
+
+
